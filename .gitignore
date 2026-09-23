@@ -1,0 +1,11 @@
+# local environment
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# refractiveindex.info database: downloaded by the app at first start
+data/
+
+# local tooling
+.claude/
