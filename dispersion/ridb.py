@@ -14,6 +14,7 @@ import datetime as _dt
 import re
 import shutil
 import tempfile
+import threading
 import warnings
 import urllib.request
 import zipfile
@@ -34,7 +35,19 @@ REPO_ZIP_URL = (
     "https://codeload.github.com/polyanskiy/refractiveindex.info-database/zip/refs/heads/main"
 )
 DEFAULT_DB_ROOT = Path(__file__).resolve().parent.parent / "data" / "database"
-_STAMP_FILE = "_downloaded.txt"
+_STAMP_FILE = "_downloaded.txt"  # inside the database folder: time of the last successful download
+_ATTEMPT_FILE = "_last_download_attempt.txt"  # next to it: survives a failed download
+
+# Downloads are rate-limited so that a shared deployment cannot hammer GitHub:
+# an existing database can be refreshed at most once per UPDATE_INTERVAL, and while
+# no database exists, attempts are spaced by RETRY_INTERVAL.
+UPDATE_INTERVAL = _dt.timedelta(hours=24)
+RETRY_INTERVAL = _dt.timedelta(minutes=10)
+_download_lock = threading.Lock()
+
+
+class DownloadThrottled(RuntimeError):
+    """A download was refused by the rate limit or because one is already running."""
 
 
 # --------------------------------------------------------------------------
@@ -49,6 +62,43 @@ def database_timestamp(root: Path = DEFAULT_DB_ROOT) -> Optional[str]:
     return stamp.read_text(encoding="utf-8").strip() if stamp.is_file() else None
 
 
+def _utcnow() -> _dt.datetime:
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _format_time(t: _dt.datetime) -> str:
+    return t.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _read_time(path: Path) -> Optional[_dt.datetime]:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M UTC"):
+        try:
+            return _dt.datetime.strptime(text, fmt).replace(tzinfo=_dt.timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def next_download_allowed(root: Path = DEFAULT_DB_ROOT) -> Optional[_dt.datetime]:
+    """UTC time from which a download is allowed again, or None if it is allowed now."""
+    root = Path(root)
+    last_try = _read_time(root.parent / _ATTEMPT_FILE)
+    if database_available(root):
+        times = [t for t in (_read_time(root / _STAMP_FILE), last_try) if t]
+        wait = UPDATE_INTERVAL
+    else:
+        times = [last_try] if last_try else []
+        wait = RETRY_INTERVAL
+    if not times:
+        return None
+    allowed = max(times) + wait
+    return allowed if allowed > _utcnow() else None
+
+
 def download_database(
     root: Path = DEFAULT_DB_ROOT,
     progress: Optional[Callable[[int, Optional[int]], None]] = None,
@@ -58,9 +108,28 @@ def download_database(
 
     *progress(bytes_done, bytes_total_or_None)* is called while downloading.
     The previous copy is only replaced once the new one extracted successfully.
+    Raises DownloadThrottled if the rate limit applies (see next_download_allowed)
+    or another download is already running in this process.
     """
     root = Path(root)
-    root.parent.mkdir(parents=True, exist_ok=True)
+    if not _download_lock.acquire(blocking=False):
+        raise DownloadThrottled("A database download is already in progress.")
+    try:
+        allowed = next_download_allowed(root)
+        if allowed:
+            what = "updated once per 24 hours" if database_available(root) else "retried every 10 minutes"
+            raise DownloadThrottled(
+                f"The database can only be {what}; next download possible at {_format_time(allowed)}."
+            )
+        root.parent.mkdir(parents=True, exist_ok=True)
+        (root.parent / _ATTEMPT_FILE).write_text(_format_time(_utcnow()), encoding="utf-8")
+        _download_and_extract(root, progress, url)
+    finally:
+        _download_lock.release()
+    return root
+
+
+def _download_and_extract(root: Path, progress, url: str) -> None:
     with tempfile.TemporaryDirectory(dir=root.parent) as tmp:
         tmp = Path(tmp)
         zpath = tmp / "db.zip"
@@ -91,13 +160,11 @@ def download_database(
 
         if not (staging / "catalog-nk.yml").is_file():
             raise RuntimeError("Downloaded archive does not contain database/catalog-nk.yml")
-        stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        (staging / _STAMP_FILE).write_text(stamp, encoding="utf-8")
+        (staging / _STAMP_FILE).write_text(_format_time(_utcnow()), encoding="utf-8")
 
         if root.exists():
             shutil.rmtree(root)
         shutil.move(str(staging), str(root))
-    return root
 
 
 # --------------------------------------------------------------------------

@@ -17,6 +17,14 @@ or double-click `run.bat`. On first start the app downloads the refractiveindex.
 database automatically (about 10 s, 60 MB on disk in `data/database`). Use
 **Refractive-index database → Update** in the sidebar to refresh it later.
 
+Downloads are rate-limited so a shared deployment can't hammer GitHub:
+* an existing database can be refreshed at most **once per 24 hours**;
+* while no database exists, attempts are spaced **10 minutes** apart;
+* only one download runs at a time.
+
+The limit is tracked in `data/`. A fresh cloud container starts without a database, so it
+downloads once on its first visit.
+
 Run the tests with `.venv\Scripts\python -m pytest`.
 
 ## Deploy on Streamlit Community Cloud
@@ -34,8 +42,16 @@ For a private app, keep the repository private and invite viewers by email in th
 ## What it does
 
 * **Input pulse:** Gaussian, sech², super-Gaussian, or a measured spectrum file
-  (two columns: wavelength, intensity). Spectral phase is a Taylor series
+  (columns: wavelength in nm, µm or m, then intensity). Spectral phase is a Taylor series
   φ(ω) = Σ φₙ/n! (ω−ω₀)ⁿ with GDD, TOD, FOD and 5th order.
+* **Measured spectral phase** (e.g. from FROG, SPIDER or d-scan). It can come from a 3rd
+  column of the spectrum file or from a separate (wavelength, phase) file:
+  * units are rad or deg, and a wrapped phase can be unwrapped;
+  * it is added to the Taylor phase;
+  * a sidebar caption shows its fitted GDD/TOD, as a check of the sign convention. Use
+    *Flip phase sign* if your software uses the opposite one.
+
+  Outside the measured range the phase is held constant, with a warning.
 * **SPM-broadened spectrum** (e.g. a Yb laser such as a 300 fs CARBIDE after a multipass
   cell). A transform-limited seed (sech² or Gaussian) gets E(t) = √I(t)·exp(iB·I(t)/I₀).
   Set either the B-integral or a target compressed FWHM, and the app solves for B.

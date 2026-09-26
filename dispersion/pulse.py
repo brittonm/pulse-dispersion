@@ -167,6 +167,9 @@ class Spectrum:
     For "custom", give wavelength (nm) and intensity arrays; set
     ``per_wavelength=True`` if the intensity is a density per unit wavelength
     (as from most spectrometers) so it is converted to per unit frequency.
+    A measured spectral phase (rad, this module's sign convention) can be given as
+    ``custom_phase_wl_nm`` / ``custom_phase``; with ``custom_phase_unwrap`` it is
+    unwrapped along frequency first. Outside its range the phase is held constant.
     For "spm", a transform-limited seed (``spm_seed_fs``, ``spm_seed_shape``) is
     broadened by self-phase modulation with peak nonlinear phase ``spm_b`` (rad).
     ``spm_phase`` selects the pulse's spectral phase: "flat" (ideally compressed),
@@ -180,6 +183,9 @@ class Spectrum:
     custom_wl_nm: Optional[np.ndarray] = None
     custom_intensity: Optional[np.ndarray] = None
     per_wavelength: bool = True
+    custom_phase_wl_nm: Optional[np.ndarray] = None
+    custom_phase: Optional[np.ndarray] = None
+    custom_phase_unwrap: bool = True
     spm_seed_fs: float = 300.0
     spm_seed_shape: str = "sech2"
     spm_b: float = 10.0
@@ -188,9 +194,34 @@ class Spectrum:
     def _spm(self):
         return spm_spectrum(float(self.spm_seed_fs), self.spm_seed_shape, float(self.spm_b))
 
+    def _custom_phase_arrays(self):
+        wl = np.asarray(self.custom_phase_wl_nm, dtype=float)
+        ph = np.asarray(self.custom_phase, dtype=float)
+        keep = np.isfinite(wl) & np.isfinite(ph) & (wl > 0)
+        w = wl_nm_to_omega(wl[keep])
+        order = np.argsort(w)
+        w, ph = w[order], ph[keep][order]
+        if self.custom_phase_unwrap:
+            ph = np.unwrap(ph)
+        return w - self.omega0, ph
+
+    @property
+    def has_measured_phase(self) -> bool:
+        return self.shape == "custom" and self.custom_phase is not None and len(self.custom_phase) > 1
+
+    def measured_phase_range(self) -> Optional[tuple[float, float]]:
+        """Detuning interval covered by the measured phase, if any."""
+        if not self.has_measured_phase:
+            return None
+        x, _ = self._custom_phase_arrays()
+        return float(x[0]), float(x[-1])
+
     def phase(self, dw: np.ndarray) -> np.ndarray:
-        """Intrinsic spectral phase of the source (rad); non-zero only for SPM spectra."""
+        """Intrinsic spectral phase of the source (rad): SPM or measured, else zero."""
         dw = np.asarray(dw, dtype=float)
+        if self.has_measured_phase:
+            x, ph = self._custom_phase_arrays()
+            return np.interp(dw, x, ph)
         if self.shape != "spm" or self.spm_phase == "flat":
             return np.zeros_like(dw)
         x, _, ph = self._spm()
@@ -272,6 +303,21 @@ def taylor_phase(dw: np.ndarray, coeffs: dict[int, float]) -> np.ndarray:
         if c:
             out += c / factorial(n) * dw**n
     return out
+
+
+def fit_taylor(dw: np.ndarray, phase: np.ndarray, weight: np.ndarray, order: int = 4) -> list[float]:
+    """Intensity-weighted polynomial fit of a spectral phase about dw = 0.
+
+    Returns [GD (fs), GDD (fs²), TOD (fs³), FOD (fs⁴), ...] up to *order*.
+    """
+    ok = np.isfinite(phase) & (weight > 0)
+    x, y, w = dw[ok], phase[ok], np.sqrt(weight[ok])
+    if x.size <= order:
+        return [0.0] * order
+    half = max(abs(x.min()), abs(x.max()))
+    p = np.polynomial.polynomial.Polynomial.fit(x, y, order, w=w, domain=[-half, half], window=[-1, 1])
+    c = p.convert().coef
+    return [float(c[n] * factorial(n)) if n < len(c) else 0.0 for n in range(1, order + 1)]
 
 
 def dispersion_coefficients(phase_fn, omega0: float, orders: int = 4) -> list[float]:
@@ -447,6 +493,16 @@ def simulate(
     S[(dw < -hi_lim)] = 0.0
     mask = S > 1e-14 * S.max()
     A = np.sqrt(S)
+    rng = spec.measured_phase_range()
+    if rng is not None:
+        sig = dw[S > 1e-2 * S.max()]
+        if sig.min() < rng[0] or sig.max() > rng[1]:
+            to_nm = lambda x: float(omega_to_wl_nm(w0 + x))
+            warnings.append(
+                f"The measured phase covers {to_nm(rng[1]):.0f}–{to_nm(rng[0]):.0f} nm but the spectrum "
+                f"(> 1 % of peak) spans {to_nm(sig.max()):.0f}–{to_nm(sig.min()):.0f} nm; "
+                "the phase is held constant outside its range."
+            )
 
     phi_in = np.zeros(N)
     phi_in[mask] = in_phase(dw[mask])

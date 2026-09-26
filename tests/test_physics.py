@@ -108,6 +108,56 @@ def test_all_zero_coefficients(silica):
     assert r.fwhm_in == pytest.approx(r.fwhm_tl, rel=1e-6)
 
 
+def measured(gdd=0.0, tod=0.0, wrap=False, unwrap=True, wl_range=(700, 900)):
+    """Gaussian 20 nm spectrum sampled like a measurement, with a Taylor phase column."""
+    wl = np.linspace(*wl_range, 1501)
+    x = pulse.wl_nm_to_omega(wl) - pulse.wl_nm_to_omega(800)
+    width = pulse.bandwidth_nm_to_omega(800, 20)
+    s = np.exp(-4 * log(2) * (x / width) ** 2)
+    ph = pulse.taylor_phase(x, {2: gdd, 3: tod})
+    if wrap:
+        ph = np.angle(np.exp(1j * ph))
+    return Spectrum(800, "custom", custom_wl_nm=wl, custom_intensity=s, per_wavelength=False,
+                    custom_phase_wl_nm=wl, custom_phase=ph, custom_phase_unwrap=unwrap)
+
+
+def test_measured_phase_matches_taylor_phase():
+    r = simulate(measured(gdd=800.0, tod=5000.0), {})
+    ref = simulate(Spectrum(800, "gaussian", 20), {2: 800.0, 3: 5000.0})
+    assert r.fwhm_in == pytest.approx(ref.fwhm_in, rel=3e-3)
+    assert r.peak_in_rel_tl == pytest.approx(ref.peak_in_rel_tl, rel=3e-3)
+    assert not r.warnings
+
+
+def test_measured_phase_wrapped_is_unwrapped():
+    unwrapped = simulate(measured(gdd=3000.0), {})
+    wrapped = simulate(measured(gdd=3000.0, wrap=True), {})
+    assert wrapped.fwhm_in == pytest.approx(unwrapped.fwhm_in, rel=1e-6)
+
+
+def test_measured_phase_adds_to_taylor_phase():
+    # measured +800 fs² plus Taylor −800 fs² → back to the transform limit
+    r = simulate(measured(gdd=800.0), {2: -800.0})
+    assert r.fwhm_in == pytest.approx(r.fwhm_tl, rel=1e-3)
+
+
+def test_fit_taylor_recovers_imported_phase():
+    spec = measured(gdd=800.0, tod=5000.0)
+    x = np.linspace(*spec.support(), 4000)
+    S = spec.intensity(x)
+    _, gdd, tod, _ = pulse.fit_taylor(x, spec.phase(x), np.where(S > 1e-2, S, 0))
+    assert gdd == pytest.approx(800.0, rel=1e-3)
+    assert tod == pytest.approx(5000.0, rel=1e-2)
+
+
+def test_measured_phase_range_warning():
+    spec = measured(gdd=800.0)
+    wl = np.linspace(790, 810, 200)  # phase measured over only part of the spectrum
+    spec.custom_phase_wl_nm = wl
+    spec.custom_phase = pulse.taylor_phase(pulse.wl_nm_to_omega(wl) - spec.omega0, {2: 800.0})
+    assert any("measured phase covers" in w for w in simulate(spec, {}).warnings)
+
+
 def spm_spec(b, mode="flat", seed=300.0, shape="sech2"):
     return Spectrum(1030, "spm", spm_seed_fs=seed, spm_seed_shape=shape, spm_b=b, spm_phase=mode)
 

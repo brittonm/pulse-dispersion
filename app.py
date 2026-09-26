@@ -55,7 +55,11 @@ def database_panel():
         else:
             st.warning("The refractiveindex.info database has not been downloaded yet.")
             label = "Download database (~60 MB on disk)"
-        if st.button(label, width="stretch"):
+        allowed = ridb.next_download_allowed()
+        if allowed:
+            st.caption(f"Downloads are rate-limited; next one possible at "
+                       f"{allowed:%Y-%m-%d %H:%M} UTC.")
+        if st.button(label, width="stretch", disabled=allowed is not None):
             bar = st.progress(0.0, text="Downloading…")
 
             def progress(done, total):
@@ -64,6 +68,9 @@ def database_panel():
 
             try:
                 ridb.download_database(progress=progress)
+            except ridb.DownloadThrottled as exc:
+                bar.empty()
+                st.warning(str(exc))
             except Exception as exc:  # network etc.
                 st.error(f"Download failed: {exc}")
             else:
@@ -86,19 +93,20 @@ def fmt_time(fs: float) -> str:
     return f"{fs:.2f} fs"
 
 
-def parse_spectrum_file(data: bytes) -> tuple[np.ndarray, np.ndarray]:
-    """Two numeric columns (wavelength, intensity); header/comment lines are skipped."""
+def parse_columns(data: bytes, ncols: int, what: str) -> np.ndarray:
+    """First *ncols* numeric columns of a text/CSV file; header/comment lines are skipped."""
     rows = []
     for line in data.decode("utf-8", errors="ignore").splitlines():
         parts = line.replace(",", " ").replace(";", " ").replace("\t", " ").split()
         try:
-            rows.append((float(parts[0]), float(parts[1])))
-        except (ValueError, IndexError):
+            rows.append([float(v) for v in parts[:ncols]])
+        except ValueError:
             continue
+        if len(rows[-1]) < ncols:
+            rows.pop()
     if len(rows) < 3:
-        raise ValueError("Could not find two numeric columns (wavelength, intensity).")
-    arr = np.array(rows)
-    return arr[:, 0], arr[:, 1]
+        raise ValueError(f"Could not find {ncols} numeric columns ({what}).")
+    return np.array(rows)
 
 
 def crop_and_decimate(x, y_list, rel=1e-4, margin=0.25, max_pts=4000):
@@ -140,30 +148,7 @@ def pulse_inputs() -> tuple[Spectrum, dict[int, float]]:
         }.get,
         key="shape", on_change=_shape_changed,
     )
-    custom_wl = custom_I = None
-    per_wl = True
-    if shape == "custom":
-        up = sb.file_uploader("Spectrum file (λ, intensity)", type=["csv", "txt", "dat", "tsv"])
-        unit = sb.radio("Wavelength column unit", ["nm", "µm"], horizontal=True)
-        per_wl = sb.checkbox(
-            "Intensity is per unit wavelength (spectrometer)", value=True,
-            help="Converts S(λ) to S(ω) with the λ² Jacobian.",
-        )
-        if up is None:
-            sb.info("Upload a two-column text/CSV file to continue.")
-            st.stop()
-        try:
-            custom_wl, custom_I = parse_spectrum_file(up.getvalue())
-        except ValueError as exc:
-            sb.error(str(exc))
-            st.stop()
-        if unit == "µm":
-            custom_wl = custom_wl * 1e3
-        w = np.clip(custom_I, 0, None)
-        centroid = float((custom_wl * w).sum() / w.sum())
-        sb.caption(f"Spectrum centroid: {centroid:.1f} nm")
-        if sb.button("Use centroid as centre wavelength"):
-            st.session_state.center_nm = round(centroid, 2)
+    custom = custom_inputs() if shape == "custom" else {}
 
     center = sb.number_input(
         "Centre wavelength λ₀ (nm)", min_value=100.0, max_value=20000.0, step=10.0,
@@ -194,8 +179,103 @@ def pulse_inputs() -> tuple[Spectrum, dict[int, float]]:
         5: c2.number_input("5th (fs⁵)", step=1e4, key="fifth", format="%.1f"),
     }
     sb.button("Reset phase to zero", on_click=_reset_phase, width="stretch")
-    spec = Spectrum(center, shape, fwhm_nm, sg, custom_wl, custom_I, per_wl, **spm)
+    spec = Spectrum(center, shape, fwhm_nm, sg, **custom, **spm)
+    if spec.has_measured_phase:
+        show_measured_phase_fit(spec)
     return spec, coeffs
+
+
+PHASE_SOURCES = {
+    "none": "None (flat, transform-limited)",
+    "column": "3rd column of the spectrum file",
+    "file": "Separate file (λ, phase)",
+}
+
+
+WAVELENGTH_UNITS = {"nm": 1.0, "µm": 1e3, "m": 1e9}  # factor to nm
+
+
+def custom_inputs() -> dict:
+    """Measured spectrum file, optionally with a measured spectral phase."""
+    sb = st.sidebar
+    phase_keys = ["custom_wl_unit", "custom_phase_src", "custom_phase_unit", "custom_phase_unwrap",
+                  "custom_phase_flip"]
+    _keep(*phase_keys)
+    up = sb.file_uploader("Spectrum file (λ, intensity[, phase])", type=["csv", "txt", "dat", "tsv"])
+    unit = sb.radio("Wavelength column unit", list(WAVELENGTH_UNITS), horizontal=True,
+                    key="custom_wl_unit", help="Unit of the first column, e.g. m for 1.03e-6.")
+    per_wl = sb.checkbox(
+        "Intensity is per unit wavelength (spectrometer)", value=True,
+        help="Converts S(λ) to S(ω) with the λ² Jacobian.",
+    )
+    src = sb.selectbox("Spectral phase", list(PHASE_SOURCES), format_func=PHASE_SOURCES.get,
+                       key="custom_phase_src",
+                       help="e.g. from FROG, SPIDER or d-scan retrieval. Added to the Taylor phase below.")
+    phase_up = None
+    if src == "file":
+        phase_up = sb.file_uploader("Phase file (λ, phase)", type=["csv", "txt", "dat", "tsv"],
+                                    help="Uses the same wavelength unit as the spectrum file.")
+    if src != "none":
+        c1, c2 = sb.columns(2)
+        ph_unit = c1.radio("Phase unit", ["rad", "deg"], horizontal=True, key="custom_phase_unit")
+        unwrap = c2.checkbox("Unwrap", key="custom_phase_unwrap",
+                             help="Remove 2π jumps from a wrapped (−π…π) phase.")
+        flip = sb.checkbox(
+            "Flip phase sign", key="custom_phase_flip",
+            help="This app uses E(t) = ∫Ẽ(ω)e^(−iωt)dω with Ẽ ∝ e^(+iφ): positive GDD means an "
+                 "up-chirp, as after glass. If your software uses the opposite convention, flip it "
+                 "(check the fitted GDD below).",
+        )
+    _remember(*phase_keys)
+
+    if up is None:
+        sb.info("Upload a text/CSV file with columns: wavelength, intensity"
+                + (", phase" if src == "column" else "") + ".")
+        st.stop()
+    try:
+        cols = parse_columns(up.getvalue(), 3 if src == "column" else 2,
+                             "wavelength, intensity, phase" if src == "column" else "wavelength, intensity")
+        phase = None
+        if src == "file":
+            if phase_up is None:
+                sb.info("Upload the phase file to continue.")
+                st.stop()
+            phase = parse_columns(phase_up.getvalue(), 2, "wavelength, phase")
+        elif src == "column":
+            phase = cols[:, [0, 2]]
+    except ValueError as exc:
+        sb.error(str(exc))
+        st.stop()
+
+    scale = WAVELENGTH_UNITS[unit]
+    typical = float(np.median(cols[:, 0])) * scale
+    if not 50 <= typical <= 1e5:  # 50 nm – 100 µm
+        guess = min(WAVELENGTH_UNITS, key=lambda u: abs(np.log10(np.median(cols[:, 0]) * WAVELENGTH_UNITS[u] / 1000)))
+        sb.error(f"With unit '{unit}' the wavelengths are around {typical:.3g} nm, which looks wrong. "
+                 f"Is the file in {guess}?")
+        st.stop()
+    out = dict(custom_wl_nm=cols[:, 0] * scale, custom_intensity=cols[:, 1], per_wavelength=per_wl)
+    if phase is not None:
+        ph = phase[:, 1] * (np.pi / 180 if ph_unit == "deg" else 1.0) * (-1 if flip else 1)
+        out.update(custom_phase_wl_nm=phase[:, 0] * scale, custom_phase=ph, custom_phase_unwrap=unwrap)
+
+    w = np.clip(cols[:, 1], 0, None)
+    centroid = float((out["custom_wl_nm"] * w).sum() / w.sum())
+    sb.caption(f"Spectrum centroid: {centroid:.1f} nm")
+    if sb.button("Use centroid as centre wavelength"):
+        st.session_state.center_nm = round(centroid, 2)
+    return out
+
+
+def show_measured_phase_fit(spec: Spectrum):
+    """Caption with the Taylor coefficients of the imported phase: a quick sign/unit check."""
+    lo, hi = spec.support()
+    x = np.linspace(lo, hi, 4000)
+    S = spec.intensity(x)
+    weight = np.where(S > 1e-2 * S.max(), S, 0.0)
+    _, gdd, tod, _ = pulse.fit_taylor(x, spec.phase(x), weight)
+    st.sidebar.caption(f"Imported phase ≈ GDD {gdd:,.0f} fs², TOD {tod:,.0f} fs³ at λ₀ "
+                       "(fit over the spectrum above 1 % of peak).")
 
 
 SPM_PHASE_LABELS = {
@@ -207,6 +287,11 @@ SPM_PHASE_LABELS = {
 
 WIDGET_DEFAULTS = {
     "fwhm_nm": 30.0,
+    "custom_wl_unit": "nm",
+    "custom_phase_src": "none",
+    "custom_phase_unit": "rad",
+    "custom_phase_unwrap": True,
+    "custom_phase_flip": False,
     "spm_seed_fs": 300.0,
     "spm_seed_shape": "sech2",
     "spm_by": "Target compressed FWHM",
